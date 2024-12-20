@@ -1668,7 +1668,7 @@ plot_palette_info <- function(colors) {
   }
 }
 
-result <- generate_categorical_palette(8, base_colors = c("#D55E00", "#0072B2"),
+result <- generate_categorical_palette(8, base_colors = c("#E69F00", "#0072B2"),
                                        iterations = 500)
 
 result <- generate_categorical_palette(8, base_colors = c("#001959", "#114761", "#FDB0AA", "#F9CCF9"),

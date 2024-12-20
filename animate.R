@@ -72,7 +72,7 @@ animate_repulsion <- function(n_colors,
 # Usage example
 set.seed(123)
 animate_repulsion(8, 
-                  base_colors = c("#F9A904", "#00559D"),
+                  base_colors = c("#E69F00", "#0072B2"),
                   max_iterations = 400,
                   learning_rate = 500,
                   save_every = 5,
