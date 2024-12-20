@@ -97,7 +97,7 @@ calc_perceptual_distance <- function(color1, color2) {
   
   # Combined metric
   #0.8 * cie_dist + 0.12 * hue_diff + 0.08 * light_contrast
-  0.7 * cie_dist + 0.2 * hue_diff + 0.1 * light_contrast
+  1 * cie_dist + 0 * hue_diff + 0 * light_contrast
 }
 
 enhanced_perceptual_distance <- function(color1, color2) {
@@ -142,6 +142,7 @@ validate_cvd <- function(palette) {
   tritan_sim <- tritan(palette)
   
   min_distances <- c(
+    min(calc_palette_distances(palette)),
     min(calc_palette_distances(deutan_sim)),
     min(calc_palette_distances(protan_sim)),
     min(calc_palette_distances(tritan_sim))
@@ -149,12 +150,32 @@ validate_cvd <- function(palette) {
   return(min(min_distances))
 }
 
-sort_palette <- function(palette, base_colors = palette[1:2]) {
+sort_palette <- function(palette, base_colors = NULL) {
   if (length(palette) <= 2) return(palette)
   
+  if(!is.null(base_colors)){
+    sorted_colors <- base_colors
+    remaining_colors <- setdiff(palette, base_colors)
+  } else {
+    min_distances <- sapply(palette, function(color) {
+      min(
+        unlist(
+          sapply(
+            sapply(palette,
+                   function(sc) calc_perceptual_distance(color, sc)
+                   ),
+            function(i) if(i > 0) i)
+          )
+        )
+    })
+    
+    # Add color with maximum minimum distance
+    best_color <- palette[which.max(min_distances)]
+    sorted_colors <- c(best_color)
+    remaining_colors <- setdiff(palette, best_color)
+  }
   # Start with base colors
-  sorted_colors <- base_colors
-  remaining_colors <- setdiff(palette, base_colors)
+
   
   while (length(remaining_colors) > 0) {
     # For each remaining color, get its minimum distance to current palette
@@ -175,7 +196,11 @@ sort_palette <- function(palette, base_colors = palette[1:2]) {
 #' @param palette_list List of palettes, each palette being a vector of hex colors
 #' Plot multiple color palettes for comparison
 #' @param palette_list List of palettes, each palette being a vector of hex colors
-compare_palettes <- function(palette_list, labels = NULL, add_hex = FALSE) {
+compare_palettes <- function(palette_list,
+                             labels = NULL,
+                             add_hex = FALSE,
+                             base_colors = NULL,
+                             sorted = FALSE) {
   # Input validation
   if (!is.list(palette_list)) {
     stop("palette_list must be a list of color vectors")
@@ -202,6 +227,9 @@ compare_palettes <- function(palette_list, labels = NULL, add_hex = FALSE) {
   # Plot each palette
   for (i in seq_along(palette_list)) {
     palette <- palette_list[[i]]
+    if(sorted) {
+      palette = sort_palette(palette, base_colors = base_colors)
+    }
     n_colors <- length(palette)
     
     # Plot color rectangles
@@ -233,7 +261,7 @@ compare_palettes <- function(palette_list, labels = NULL, add_hex = FALSE) {
     }
     
     # Add palette labels
-    text(0, n_palettes-i+0.75+0.4/2, 
+    text(-0.25, n_palettes-i+0.75, 
          labels = labels[i], 
          pos = 2, 
          xpd = TRUE)
@@ -1356,6 +1384,7 @@ adjust_for_cvd <- function(colors, iterations = 100, base_colors = NULL) {
   
   # Find indices of base colors if provided
   if(!is.null(base_colors)) base_indices <- which(colors$hex %in% base_colors)
+  modify_indices <- setdiff(1:nrow(lab_points), base_indices)
   
   best_score <- validate_cvd(colors$hex)
   best_points <- lab_points
@@ -1363,16 +1392,24 @@ adjust_for_cvd <- function(colors, iterations = 100, base_colors = NULL) {
   for(i in 1:iterations) {
     # Create noise matrix
     noise <- matrix(0, nrow=nrow(lab_points), ncol=3)
-    noise[,2:3] <- matrix(
-      rnorm(2*nrow(lab_points),
+    noise[modify_indices,1] <- matrix(
+      rnorm(length(modify_indices),
             0,
-            0.2 * mean(abs(lab_points[,2:3]))),
-      ncol=2)
+            0.1 * mean(abs(lab_points[,1]))),
+      ncol=1)
     
-    # Set noise to 0 for base colors
-    if(length(base_indices) > 0) {
-      noise[base_indices,] <- 0
-    }
+    noise[modify_indices,2] <- matrix(
+      rnorm(length(modify_indices),
+            0,
+            0.1 * mean(abs(lab_points[,2]))),
+      ncol=1)
+    
+    noise[modify_indices,3] <- matrix(
+      rnorm(length(modify_indices),
+            0,
+            0.1 * mean(abs(lab_points[,3]))),
+      ncol=1)
+    
     new_points <- lab_points + noise
     
     # Constrain to valid LAB space
@@ -1475,30 +1512,102 @@ adjust_for_cvd_cie <- function(colors, iterations = 50, base_colors = NULL) {
   ))
 }
 
-fine_tune_aesthetics <- function(colors, base_colors = NULL) {
+fine_tune_aesthetics <- function(colors, base_colors = NULL, 
+                                 min_chroma = 30, target_chroma = 60, 
+                                 maintain_separation = TRUE) {
   lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
   target_L <- lab_points[,1]
   
   # Find indices of base colors if provided
-  if(!is.null(base_colors)) base_indices <- which(colors$hex %in% base_colors)
+  base_indices <- if(!is.null(base_colors)) {
+    which(colors$hex %in% base_colors)
+  } else numeric(0)
+  
   modify_indices <- setdiff(1:nrow(lab_points), base_indices)
   
   if(length(modify_indices) > 0) {
-    # Maybe adjust chroma (a,b values) if colors are too gray
+    # Convert to LCH for easier chroma manipulation
     lch_points <- convert_colour(lab_points, from="lab", to="lch")
-    low_chroma <- lch_points[modify_indices,2] < 30
-    if(any(low_chroma)) {
-      lch_points[modify_indices[low_chroma],2] <- 30
-      lab_points[modify_indices,] <- convert_colour(lch_points[modify_indices,], from="lch", to="lab")
+    
+    # Function to check if colors are still distinguishable
+    check_separation <- function(new_lab) {
+      min_dist <- Inf
+      for(i in 1:(nrow(new_lab)-1)) {
+        for(j in (i+1):nrow(new_lab)) {
+          rgb_i <- convert_colour(matrix(new_lab[i,], ncol=3), from="lab", to="rgb")
+          rgb_j <- convert_colour(matrix(new_lab[j,], ncol=3), from="lab", to="rgb")
+          dist <- compare_colour(rgb_i, rgb_j, "rgb", "lab", method="cie2000")
+          min_dist <- min(min_dist, dist)
+        }
+      }
+      return(min_dist)
     }
     
-    # Or ensure minimum a,b distances
-    # Or adjust hue angles
-    # etc.
+    # Get initial minimum separation
+    #initial_separation <- check_separation(lab_points)
+    initial_separation <- validate_cvd(colors$hex)
+    
+    
+    # Increase chroma gradually while maintaining separation
+    for(i in modify_indices) {
+      current_chroma <- lch_points[i,2]
+      
+      if(current_chroma < target_chroma) {
+        # Try to increase chroma
+        test_lch <- lch_points
+        
+        # Find maximum possible chroma increase that maintains RGB gamut
+        max_chroma <- current_chroma
+        step_size <- 1
+        
+        while(TRUE) {
+          test_chroma <- max_chroma + step_size
+          if(test_chroma > target_chroma) {break}
+          test_lch[i,2] <- test_chroma
+          
+          # Convert to RGB to check if in gamut
+          test_lab <- convert_colour(colour = matrix(test_lch[i,], ncol = 3), from="lch", to="lab")
+          test_rgb <- convert_colour(test_lab, from="lab", to="rgb")
+          
+          # Check if RGB values are valid and maintain separation
+          if(all(test_rgb >= 0 & test_rgb <= 255)) {
+            if(!maintain_separation) {
+              max_chroma <- test_chroma
+            } else {
+              # Check if color separation is maintained
+              test_all_lab <- convert_colour(test_lch, from="lch", to="lab")
+              
+              rgb_colors <- convert_colour(test_all_lab, from="lab", to="rgb")/255
+              hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
+              if(validate_cvd(hex_colors) >= initial_separation * 0.95) {
+              
+              #if(check_separation(test_all_lab) >= initial_separation * 0.95) {
+                max_chroma <- test_chroma
+              } else {
+                break
+              }
+            }
+          } else {
+            break
+          }
+        }
+        
+        # Set final chroma to maximum found or target, whichever is smaller
+        lch_points[i,2] <- min(max_chroma, target_chroma)
+      }
+    }
+    
+    # Ensure minimum chroma
+    low_chroma <- lch_points[modify_indices,2] < min_chroma
+    if(any(low_chroma)) {
+      lch_points[modify_indices[low_chroma],2] <- min_chroma
+    }
+    
+    # Convert back to LAB
+    lab_points[modify_indices,] <- convert_colour(lch_points[modify_indices,], from="lch", to="lab")
   }
   
-  lab_points[,1] <- target_L  # Keep constant lightness
-  
+  # Convert to RGB
   rgb_colors <- convert_colour(lab_points, from="lab", to="rgb")/255
   hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
   
@@ -1559,12 +1668,16 @@ plot_palette_info <- function(colors) {
   }
 }
 
-result <- generate_categorical_palette(8, base_colors = c("#F9A904", "#00559D"),
+result <- generate_categorical_palette(8, base_colors = c("#D55E00", "#0072B2"),
                                        iterations = 500)
+
+result <- generate_categorical_palette(8, base_colors = c("#001959", "#114761", "#FDB0AA", "#F9CCF9"),
+                                       iterations = 500)
+
 plot_palette_info(result)
 
 # Compare with original base colors
 compare_palettes(list(
-  result$hex,
-  generate_simple_palettes(c("#F9A904", "#00559D"), n_colors = 8)
-))
+  foo,
+  c(result$hex[c(1,2)], result$hex[5:8], result$hex[c(3,4)]) 
+), labels = c("batlow8", "batlow mutation"), add_hex = TRUE)
