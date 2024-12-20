@@ -173,13 +173,15 @@ sort_palette <- function(palette, base_colors = palette[1:2]) {
 
 #' Plot multiple color palettes for comparison
 #' @param palette_list List of palettes, each palette being a vector of hex colors
-compare_palettes <- function(palette_list) {
+#' Plot multiple color palettes for comparison
+#' @param palette_list List of palettes, each palette being a vector of hex colors
+compare_palettes <- function(palette_list, labels = NULL, add_hex = FALSE) {
   # Input validation
   if (!is.list(palette_list)) {
     stop("palette_list must be a list of color vectors")
   }
   
-  labels <- paste("Palette", seq_along(palette_list))
+  if(is.null(labels)) labels <- paste("Palette", seq_along(palette_list))
   
   # Calculate dimensions
   n_palettes <- length(palette_list)
@@ -204,8 +206,30 @@ compare_palettes <- function(palette_list) {
     
     # Plot color rectangles
     for (j in seq_along(palette)) {
+      # Draw rectangle
       rect(j-1, n_palettes-i+0.4/2, j, n_palettes-i+1+0.4/2, 
            col = palette[[j]], border = "gray80")
+      
+      if(add_hex){
+        # Add hex code as vertical text
+        # Calculate text position
+        x_pos <- j - 0.5
+        y_pos <- n_palettes-i+0.7+0.4/2
+        
+        # Determine if color is dark (for text contrast)
+        rgb_vals <- col2rgb(palette[[j]])/255
+        luminance <- 0.2126 * rgb_vals[1] + 0.7152 * rgb_vals[2] + 0.0722 * rgb_vals[3]
+        text_col <- if(luminance < 0.5) "white" else "black"
+        
+        # Add text
+        text(x_pos, y_pos, 
+             labels = toupper(palette[[j]]),
+             srt = 90,  # Rotate text 90 degrees
+             adj = c(0.5, 0.5),  # Center text
+             col = text_col,
+             cex = 0.8)  # Slightly smaller text
+      }  
+
     }
     
     # Add palette labels
@@ -1098,56 +1122,219 @@ sciency_result = test_scientific()
 
 
 # Force-directed layout in LAB space
-simulate_color_repulsion <- function(n_colors, max_iterations = 100, learning_rate = 0.1) {
-  # Initialize points randomly in LAB space
-  # L: 30-90 to avoid extremes
-  # a,b: -80 to 80 to stay within typical gamut
+simulate_color_repulsion <- function(n_colors,
+                                                 max_iterations = 100,
+                                                 learning_rate = 50,
+                                                 base_colors = NULL,
+                                                 save_every = 5,
+                                                 boundary_force = 0.3,
+                                     return_states = FALSE) { # New parameter for boundary force
+  
+  L_range <- if(!is.null(base_colors)) {
+    rgb_base <- t(sapply(base_colors, function(c) col2rgb(c)))
+    lab_base <- convert_colour(rgb_base, from="rgb", to="lab")
+    c(min(lab_base[,1]), max(lab_base[,1]))
+  } else {
+    c(40, 80)
+  }
+  
   points <- matrix(nrow = n_colors, ncol = 3)
-  points[,1] <- runif(n_colors, 30, 90)  # L
-  points[,2] <- runif(n_colors, -80, 80)  # a
-  points[,3] <- runif(n_colors, -80, 80)  # b
+  n_base <- if(!is.null(base_colors)) length(base_colors) else 0
+  n_random <- n_colors - n_base
+  
+  # Set base colors
+  if(n_base > 0) {
+    points[1:n_base,] <- convert_colour(rgb_base, from="rgb", to="lab")
+  }
+  
+  # Initialize remaining points for uniform perceptual distribution
+  if(n_random > 0) {
+    random_indices <- (n_base + 1):n_colors
+    # Use wider L* range since we're not prioritizing lightness hierarchy
+    L_min <- 30  # Still avoid extremely dark colors
+    L_max <- 90  # Still avoid extremely light colors
+    
+    # Initialize with more saturated colors
+    points[random_indices,1] <- runif(n_random, L_min, L_max)
+    
+    # Initialize a* and b* with minimum saturation
+    min_saturation <- 30
+    for(i in 1:n_random) {
+      # Generate random angle in radians
+      theta <- runif(1, 0, 2*pi)
+      # Random radius between min_saturation and 60
+      r <- runif(1, min_saturation, 60)
+      # Convert to a* b* coordinates
+      points[random_indices[i],2] <- r * cos(theta)
+      points[random_indices[i],3] <- r * sin(theta)
+    }
+  }
+  
+  # List to store states
+  states <- list()
+  states[[1]] <- points
+  
+  # Define boundary coordinates
+  boundaries <- list(
+    L = L_range,
+    a = c(-80, 80),
+    b = c(-80, 80)
+  )
   
   for(iter in 1:max_iterations) {
-    # Calculate repulsive forces between all pairs
     forces <- matrix(0, nrow = n_colors, ncol = 3)
     
-    for(i in 1:n_colors) {
-      for(j in 1:n_colors) {
-        if(i != j) {
-          # Vector from j to i
-          diff <- points[i,] - points[j,]
-          # Distance between points
-          dist <- sqrt(sum(diff^2))
-          # Force magnitude (inverse square law)
-          magnitude <- 1 / (dist^2)
-          # Accumulate force
-          forces[i,] <- forces[i,] + diff/dist * magnitude
+    if(n_random > 0) {
+      for(i in (n_base + 1):n_colors) {
+        # Color-to-color repulsion
+        for(j in 1:n_colors) {
+          if(i != j) {
+            rgb_i <- convert_colour(matrix(points[i,], ncol=3), from="lab", to="rgb")
+            rgb_j <- convert_colour(matrix(points[j,], ncol=3), from="lab", to="rgb")
+            
+            cie_dist <- compare_colour(rgb_i, rgb_j, "rgb", "lab", method="cie2000")
+            
+            diff <- points[i,] - points[j,]
+            # Equal weights for uniform perceptual distances
+            weights <- c(1, 1, 1)  # Treat all LAB dimensions equally
+            weighted_diff <- diff * weights
+            dist <- sqrt(sum(weighted_diff^2))
+            # Create vector of same length as diff for the magnitude
+            magnitude <- rep(1 / (cie_dist^2), length(diff))
+            # Element-wise multiplication using c()
+            force_vector <- c(weighted_diff/dist) * magnitude
+            forces[i,] <- forces[i,] + force_vector
+          }
+        }
+        
+        # Add boundary repulsion forces
+        for(dim in 1:3) {
+          boundary_min <- if(dim == 1) boundaries$L[1] else -80
+          boundary_max <- if(dim == 1) boundaries$L[2] else 80
+          
+          # Distance to boundaries
+          dist_to_min <- points[i,dim] - boundary_min
+          dist_to_max <- boundary_max - points[i,dim]
+          
+          # Exponential repulsion from boundaries
+          min_force <- boundary_force * exp(-dist_to_min/20)  # /20 controls force falloff
+          max_force <- boundary_force * exp(-dist_to_max/20)
+          
+          forces[i,dim] <- forces[i,dim] + min_force - max_force
+        }
+        
+        # Add repulsion from gray center (a=0, b=0)
+        # Calculate distance from center in a-b plane
+        dist_from_center <- sqrt(points[i,2]^2 + points[i,3]^2)
+        min_desired_saturation <- 30  # Minimum desired distance from gray
+        if(dist_from_center < min_desired_saturation) {
+          # Create outward force in a-b plane
+          saturation_force <- 0.5 * (1 - dist_from_center/min_desired_saturation)
+          # Apply force in a and b dimensions proportionally to current position
+          forces[i,2] <- forces[i,2] + saturation_force * points[i,2]/max(dist_from_center, 0.1)
+          forces[i,3] <- forces[i,3] + saturation_force * points[i,3]/max(dist_from_center, 0.1)
         }
       }
     }
     
-    # Apply forces with decreasing learning rate
-    current_lr <- learning_rate * (1 - iter/max_iterations)
+    # Calculate adaptive learning rate based on multiple factors
+    
+    # 1. Calculate average force magnitude
+    avg_force_magnitude <- mean(sqrt(rowSums(forces^2)))
+    
+    # 2. Calculate average color distance
+    avg_color_dist <- 0
+    if(n_random > 0) {
+      distances <- numeric()
+      for(i in (n_base + 1):n_colors) {
+        for(j in 1:n_colors) {
+          if(i != j) {
+            rgb_i <- convert_colour(matrix(points[i,], ncol=3), from="lab", to="rgb")
+            rgb_j <- convert_colour(matrix(points[j,], ncol=3), from="lab", to="rgb")
+            distances <- c(distances, compare_colour(rgb_i, rgb_j, "rgb", "lab", method="cie2000"))
+          }
+        }
+      }
+      avg_color_dist <- mean(distances)
+    }
+    
+    # Calculate minimum color distance to any other point
+    min_color_dist <- Inf
+    if(n_random > 0) {
+      for(i in (n_base + 1):n_colors) {
+        for(j in 1:n_colors) {
+          if(i != j) {
+            rgb_i <- convert_colour(matrix(points[i,], ncol=3), from="lab", to="rgb")
+            rgb_j <- convert_colour(matrix(points[j,], ncol=3), from="lab", to="rgb")
+            dist <- compare_colour(rgb_i, rgb_j, "rgb", "lab", method="cie2000")
+            min_color_dist <- min(min_color_dist, dist)
+          }
+        }
+      }
+    }
+    
+    # More gradual learning rate adaptation with escape mechanism
+    force_factor <- 1 / (1 + 0.05 * avg_force_magnitude)  # Much less sensitive to force magnitude
+    
+    # Increase learning rate when points are too close
+    distance_boost <- if(min_color_dist < 15) {  # Boost if points are too close
+      2.0  # Significant boost to escape local minima
+    } else {
+      1.0
+    }
+    
+    # Modified distance factor that maintains movement when needed
+    distance_threshold <- 25  # Higher threshold
+    distance_factor <- if(avg_color_dist > distance_threshold) {
+      1 / (1 + 0.02 * (avg_color_dist - distance_threshold))  # Much gentler reduction
+    } else {
+      1.2  # Slight boost when colors aren't well spread
+    }
+    
+    # Very gentle progress decay
+    progress_factor <- 1 - 0.3 * (iter/max_iterations)^0.1  # Even slower decay
+    
+    # Combine factors with a higher minimum learning rate
+    current_lr <- learning_rate * force_factor * distance_factor * progress_factor * distance_boost
+    current_lr <- max(current_lr, learning_rate * 0.2)  # Never go below 20% of initial rate
     points <- points + forces * current_lr
     
-    # Constrain points to stay in reasonable LAB space
-    points[,1] <- pmax(30, pmin(90, points[,1]))  # L
-    points[,2] <- pmax(-80, pmin(80, points[,2]))  # a
-    points[,3] <- pmax(-80, pmin(80, points[,3]))  # b
+    # Enforce boundaries (but less strictly)
+    if(n_random > 0) {
+      points[(n_base + 1):n_colors,1] <- pmax(L_range[1], pmin(L_range[2], points[(n_base + 1):n_colors,1]))
+      points[(n_base + 1):n_colors,2] <- pmax(-80, pmin(80, points[(n_base + 1):n_colors,2]))
+      points[(n_base + 1):n_colors,3] <- pmax(-80, pmin(80, points[(n_base + 1):n_colors,3]))
+    }
+    
+    if(iter %% save_every == 0) {
+      states[[length(states) + 1]] <- points
+    }
   }
   
-  return(points)
+  if(max_iterations %% save_every != 0) {
+    states[[length(states) + 1]] <- points
+  }
+  
+  if(return_states){
+    return(states)    
+  } else {
+    return(tail(states, n = 1)[[1]])
+  }
 }
 
-generate_base_distribution <- function(n_colors) {
+generate_base_distribution <- function(n_colors, base_colors = NULL, iterations = 100) {
   # Use force-directed layout to get well-distributed points
-  lab_points <- simulate_color_repulsion(n_colors)
+  lab_points <- simulate_color_repulsion(n_colors,
+                                         base_colors = base_colors,
+                                         max_iterations = iterations
+                                         )
+
   
   # Convert to RGB
   rgb_colors <- convert_colour(lab_points, from="lab", to="rgb")/255
   
   # Clip to valid RGB space
-  rgb_colors <- matrix(pmax(0, pmin(1, rgb_colors)), ncol = 3, byrow = TRUE)
+  #rgb_colors <- matrix(pmax(0, pmin(1, rgb_colors)), ncol = 3, byrow = TRUE)
   
   # Convert to hex
   hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
@@ -1159,19 +1346,37 @@ generate_base_distribution <- function(n_colors) {
   ))
 }
 
-adjust_for_cvd <- function(colors, iterations = 50) {
+adjust_for_cvd <- function(colors, iterations = 100, base_colors = NULL) {
   lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
+  L_range <- if(!is.null(base_colors)) {
+    rgb_base <- t(sapply(base_colors, function(c) col2rgb(c)))
+    lab_base <- convert_colour(rgb_base, from="rgb", to="lab")
+    c(min(lab_base[,1]), max(lab_base[,1]))
+  }
+  
+  # Find indices of base colors if provided
+  if(!is.null(base_colors)) base_indices <- which(colors$hex %in% base_colors)
   
   best_score <- validate_cvd(colors$hex)
   best_points <- lab_points
   
   for(i in 1:iterations) {
-    # Small random perturbation
-    noise <- matrix(rnorm(prod(dim(lab_points)), 0, 0.2 * mean(abs(lab_points))), ncol = 3)
+    # Create noise matrix
+    noise <- matrix(0, nrow=nrow(lab_points), ncol=3)
+    noise[,2:3] <- matrix(
+      rnorm(2*nrow(lab_points),
+            0,
+            0.2 * mean(abs(lab_points[,2:3]))),
+      ncol=2)
+    
+    # Set noise to 0 for base colors
+    if(length(base_indices) > 0) {
+      noise[base_indices,] <- 0
+    }
     new_points <- lab_points + noise
     
     # Constrain to valid LAB space
-    new_points[,1] <- pmax(30, pmin(90, new_points[,1]))
+    new_points[,1] <- pmax(L_range[[1]], pmin(L_range[[2]], new_points[,1]))
     new_points[,2] <- pmax(-80, pmin(80, new_points[,2]))
     new_points[,3] <- pmax(-80, pmin(80, new_points[,3]))
     
@@ -1200,26 +1405,101 @@ adjust_for_cvd <- function(colors, iterations = 50) {
   ))
 }
 
-fine_tune_aesthetics <- function(colors) {
+adjust_for_cvd_cie <- function(colors, iterations = 50, base_colors = NULL) {
   lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
-  
-  # Adjust chroma to ensure colors are sufficiently saturated
-  lch_points <- convert_colour(255 * colors$rgb, from="rgb", to="lch")
-  low_chroma <- lch_points[,2] < 30
-  if(any(low_chroma)) {
-    lch_points[low_chroma,2] <- 30
-    # Convert back through LAB to RGB
-    lab_points <- convert_colour(lch_points, from="lch", to="lab")
+  L_range <- if(!is.null(base_colors)) {
+    rgb_base <- t(sapply(base_colors, function(c) col2rgb(c)))
+    lab_base <- convert_colour(rgb_base, from="rgb", to="lab")
+    c(min(lab_base[,1]), max(lab_base[,1]))
   }
   
-  # Ensure colors aren't too dark or light
-  lab_points[,1] <- pmax(30, pmin(90, lab_points[,1]))
+  # Find indices of base colors if provided
+  if(!is.null(base_colors)) base_indices <- which(colors$hex %in% base_colors)
   
-  # Convert to RGB
+  best_score <- validate_cvd(colors$hex)
+  best_points <- lab_points
+  
+  for(iter in 1:iterations) {
+    # Calculate gradients based on CIE2000 distances
+    gradients <- matrix(0, nrow=nrow(lab_points), ncol=3)
+    
+    # For each pair of colors
+    for(i in 1:(nrow(lab_points)-1)) {
+      for(j in (i+1):nrow(lab_points)) {
+        # Current CIE2000 distance
+        rgb_i <- convert_colour(matrix(lab_points[i,], ncol=3), from="lab", to="rgb")
+        rgb_j <- convert_colour(matrix(lab_points[j,], ncol=3), from="lab", to="rgb")
+        current_dist <- compare_colour(rgb_i, rgb_j, "rgb", "lab", method="cie2000")
+        
+        # Small perturbation to estimate gradient
+        eps <- 0.1
+        for(dim in 1:3) {
+          lab_i_plus <- lab_points[i,]
+          lab_i_plus[dim] <- lab_i_plus[dim] + eps
+          
+          rgb_i_plus <- convert_colour(matrix(lab_i_plus, ncol=3), from="lab", to="rgb")
+          new_dist <- compare_colour(rgb_i_plus, rgb_j, "rgb", "lab", method="cie2000")
+          
+          # Gradient estimate
+          grad <- (new_dist - current_dist) / eps
+          gradients[i,dim] <- gradients[i,dim] + grad
+          gradients[j,dim] <- gradients[j,dim] - grad
+        }
+      }
+    }
+    gradients[base_indices,] = 0
+    # Apply gradients with learning rate
+    lr <- 0.01 * (1 - iter/iterations)
+    new_points <- lab_points + lr * gradients
+    
+    # Keep lightness within range
+    new_points[,1] <- pmax(L_range[[1]], pmin(L_range[[2]], new_points[,1]))
+    
+    # Convert to RGB to check if in gamut
+    rgb_test <- convert_colour(new_points, from="lab", to="rgb")/255
+    if(any(rgb_test < 0 | rgb_test > 1)) next
+    
+    hex_test <- rgb(rgb_test[,1], rgb_test[,2], rgb_test[,3])
+    score <- validate_cvd(hex_test)
+    
+    if(score > best_score) {
+      best_score <- score
+      best_points <- new_points
+    }
+  }
+  rgb_colors = convert_colour(best_points, from="lab", to="rgb")/255
+  return(list(
+    hex = rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3]),
+    lab = best_points,
+    rgb = rgb_colors
+  ))
+}
+
+fine_tune_aesthetics <- function(colors, base_colors = NULL) {
+  lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
+  target_L <- lab_points[,1]
+  
+  # Find indices of base colors if provided
+  if(!is.null(base_colors)) base_indices <- which(colors$hex %in% base_colors)
+  modify_indices <- setdiff(1:nrow(lab_points), base_indices)
+  
+  if(length(modify_indices) > 0) {
+    # Maybe adjust chroma (a,b values) if colors are too gray
+    lch_points <- convert_colour(lab_points, from="lab", to="lch")
+    low_chroma <- lch_points[modify_indices,2] < 30
+    if(any(low_chroma)) {
+      lch_points[modify_indices[low_chroma],2] <- 30
+      lab_points[modify_indices,] <- convert_colour(lch_points[modify_indices,], from="lch", to="lab")
+    }
+    
+    # Or ensure minimum a,b distances
+    # Or adjust hue angles
+    # etc.
+  }
+  
+  lab_points[,1] <- target_L  # Keep constant lightness
+  
   rgb_colors <- convert_colour(lab_points, from="lab", to="rgb")/255
-  # Clip to valid RGB
-  rgb_colors <-  matrix(pmax(0, pmin(1, rgb_colors)), ncol = 3, byrow = TRUE)
-  # Convert to hex
   hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
   
   return(list(
@@ -1229,37 +1509,24 @@ fine_tune_aesthetics <- function(colors) {
   ))
 }
 
-generate_categorical_palette <- function(n_colors, base_colors = NULL) {
+generate_categorical_palette <- function(n_colors, base_colors = NULL, iterations = 100) {
   # Stage 1: Generate well-distributed colors
   cat("Stage 1: Generating base distribution...\n")
-  colors <- generate_base_distribution(n_colors)
+  colors <- generate_base_distribution(n_colors = n_colors, base_colors = base_colors, iterations = iterations)
+  hex1 = colors$hex
   
   # Stage 2: Adjust for CVD
   cat("Stage 2: Adjusting for color vision deficiency...\n")
-  colors <- adjust_for_cvd(colors)
+  colors <- adjust_for_cvd(colors, base_colors = base_colors, iterations = iterations)
+  #colors <- adjust_for_cvd_cie(colors, base_colors = base_colors, iterations = iterations)
+  hex2 = colors$hex
   
   # Stage 3: Fine-tune aesthetics
   cat("Stage 3: Fine-tuning aesthetics...\n")
-  colors <- fine_tune_aesthetics(colors)
+  colors <- fine_tune_aesthetics(colors,  base_colors = base_colors)
+  hex3 = colors$hex
   
-  # If base colors provided, try to incorporate them
-  if(!is.null(base_colors)) {
-    # Find closest colors in generated palette and swap
-    for(base_color in base_colors) {
-      rgb_base <- col2rgb(base_color)/255
-      lab_base <- convert_colour(matrix(rgb_base, ncol=3), from="rgb", to="lab")
-      
-      # Find closest color in palette
-      distances <- apply(colors$lab, 1, function(x) sum((x - lab_base)^2))
-      closest <- which.min(distances)
-      
-      # Replace with base color
-      colors$hex[closest] <- base_color
-      colors$rgb[closest,] <- rgb_base
-      colors$lab[closest,] <- lab_base
-    }
-  }
-  
+  compare_palettes(list(hex1, hex2, hex3), labels = c("repulsion", "cvd-adjustment", "aesthetics"),add_hex = TRUE)
   return(colors)
 }
 
@@ -1292,7 +1559,8 @@ plot_palette_info <- function(colors) {
   }
 }
 
-result <- generate_categorical_palette(8, base_colors = c("#F9A904", "#00559D"))
+result <- generate_categorical_palette(8, base_colors = c("#F9A904", "#00559D"),
+                                       iterations = 500)
 plot_palette_info(result)
 
 # Compare with original base colors
