@@ -9,6 +9,34 @@ plan(multisession, workers = 8)
 handlers(global = TRUE)
 handlers("progress")
 
+# Calculate color harmony score
+calc_harmony_score <- function(palette) {
+  # Convert to LCh for better hue handling
+  rgb_vals <- t(sapply(palette, function(color) {
+    col2rgb(color)/255
+  }))
+  lch_vals <- convert_colour(rgb_vals, from="rgb", to="lch")
+  
+  # Extract hue values
+  hues <- lch_vals[,3]
+  
+  # Calculate hue differences between adjacent colors
+  hue_diffs <- diff(hues)
+  # Adjust for circular nature of hue
+  hue_diffs <- pmin(abs(hue_diffs), 360 - abs(hue_diffs))
+  
+  # Penalty for very large hue jumps
+  large_jump_penalty <- sum(hue_diffs > 90) * 0.2
+  
+  # Encourage smoother hue transitions
+  smoothness <- -sd(hue_diffs)
+  
+  # Encourage similar chroma levels for harmony
+  chroma_coherence <- -sd(lch_vals[,2])
+  
+  return(smoothness + chroma_coherence - large_jump_penalty)
+}
+
 # Function to calculate Mach band effects between colors
 calc_mach_bands <- function(color1, color2) {
   # Convert to LAB space for perceptual calculations
@@ -297,6 +325,7 @@ generate_simple_palettes <- function(base_colors, n_colors = 8) {
   return(palette_hex)
 }
 
+
 #' Calculate metrics for a palette
 #' @param palette Vector of hex colors
 #' @return List of calculated metrics
@@ -535,6 +564,182 @@ scientific_objective_function <- function(numeric_vector, metric_weights, initia
   })
 }
 
+harmonious_objective_function <- function(numeric_vector, metric_weights, initial_colors) {
+  MAX_PENALTY <- 1e6
+  
+  tryCatch({
+    if (length(numeric_vector) == 0 || length(numeric_vector) %% 3 != 0) {
+      return(MAX_PENALTY)
+    }
+    
+    numeric_vector <- pmax(0, pmin(1, numeric_vector))
+    palette <- unflatten_palette(numeric_vector)
+    
+    # Preserve initial colors
+    initial_rgb <- t(sapply(initial_colors, function(color) {
+      rgb <- col2rgb(color)/255
+      as.vector(rgb)
+    }))
+    current_rgb <- matrix(numeric_vector[1:(length(initial_colors) * 3)], 
+                          ncol = 3, byrow = TRUE)
+    initial_color_penalty <- sum((initial_rgb - current_rgb)^2) * 1000
+    
+    # Calculate enhanced perceptual distances
+    enhanced_distances <- numeric()
+    for(i in 1:(length(palette)-1)) {
+      for(j in (i+1):length(palette)) {
+        enhanced_distances <- c(enhanced_distances, 
+                                enhanced_perceptual_distance(palette[i], palette[j]))
+      }
+    }
+    
+    # Calculate harmony score
+    harmony_score <- calc_harmony_score(palette)
+    
+    # Calculate standard metrics
+    metrics <- calculate_palette_metrics(palette)
+    if (!is_valid_metrics(metrics)) {
+      return(MAX_PENALTY)
+    }
+    
+    # More balanced CVD handling
+    cvd_score <- validate_cvd(palette)
+    cvd_penalty <- if(cvd_score < 0.15) {
+      200  # Reduced penalty to allow more harmony
+    } else if(cvd_score < 0.2) {
+      100
+    } else {
+      0
+    }
+    
+    # Calculate perceptual uniformity with more emphasis on smooth transitions
+    rgb_vals <- t(sapply(palette, function(color) {
+      col2rgb(color)/255
+    }))
+    lab_vals <- convert_colour(rgb_vals, from="rgb", to="lab")
+    
+    lightness_steps <- diff(lab_vals[,1])
+    chroma_steps <- diff(sqrt(lab_vals[,2]^2 + lab_vals[,3]^2))
+    
+    uniformity_score <- -sd(lightness_steps) - sd(chroma_steps)
+    
+    # Combine all components with harmony
+    base_score <- sum(c(
+      min(enhanced_distances) * metric_weights["min_distance"] * 0.8,  # Reduced weight
+      mean(enhanced_distances) * metric_weights["mean_distance"] * 0.8,
+      metrics$min_contrast * metric_weights["min_contrast"],
+      metrics$lightness_contrast_spread * metric_weights["lightness_contrast_spread"],
+      metrics$hue_diversity * metric_weights["hue_diversity"] * 0.7,  # Reduced weight
+      uniformity_score * 0.15,
+      harmony_score * 0.3  # New harmony component
+    ))
+    
+    final_score <- -(base_score - cvd_penalty - initial_color_penalty)
+    
+    if (!is.finite(final_score)) {
+      return(MAX_PENALTY)
+    }
+    
+    return(final_score)
+  }, error = function(e) {
+    return(MAX_PENALTY)
+  })
+}
+
+categorical_objective_function <- function(numeric_vector, metric_weights, initial_colors) {
+  MAX_PENALTY <- 1e6
+  
+  tryCatch({
+    if (length(numeric_vector) == 0 || length(numeric_vector) %% 3 != 0) {
+      return(MAX_PENALTY)
+    }
+    
+    numeric_vector <- pmax(0, pmin(1, numeric_vector))
+    palette <- unflatten_palette(numeric_vector)
+    
+    # 1. Preserve initial colors
+    initial_rgb <- t(sapply(initial_colors, function(color) {
+      rgb <- col2rgb(color)/255
+      as.vector(rgb)
+    }))
+    current_rgb <- matrix(numeric_vector[1:(length(initial_colors) * 3)], 
+                          ncol = 3, byrow = TRUE)
+    initial_color_penalty <- sum((initial_rgb - current_rgb)^2) * 1000
+    
+    # 2. Calculate perceptual distances between all pairs
+    distances <- matrix(0, nrow = length(palette), ncol = length(palette))
+    for(i in 1:length(palette)) {
+      for(j in 1:length(palette)) {
+        if(i != j) {
+          distances[i,j] <- calc_perceptual_distance(palette[i], palette[j])
+        }
+      }
+    }
+    
+    # 3. Convert to LAB space for luminance analysis
+    rgb_vals <- t(sapply(palette, function(color) {
+      col2rgb(color)/255
+    }))
+    lab_vals <- convert_colour(rgb_vals, from="rgb", to="lab")
+    
+    # 4. Key components for categorical effectiveness:
+    
+    # a) Minimum distance between any pair - crucial for categorical distinction
+    min_dist <- min(distances[distances > 0])
+    min_dist_score <- min_dist * 2.0  # High weight as this is crucial
+    
+    # b) Variance of pairwise distances - should be low for equal distinctiveness
+    dist_variance <- -sd(distances[distances > 0]) * 0.5
+    
+    # c) Luminance uniformity - colors should have similar "weight"
+    luminance_spread <- -sd(lab_vals[,1]) * 1.0
+    
+    # d) Penalty for clusters - discourage groups of similar colors
+    cluster_penalty <- sum(distances[distances > 0 & distances < 0.2]) * 0.5
+    
+    # e) Penalize extreme luminance values
+    extreme_luminance_penalty <- sum(lab_vals[,1] < 20 | lab_vals[,1] > 90) * 50
+    
+    # f) Color blindness considerations
+    cvd_score <- validate_cvd(palette)
+    cvd_penalty <- if(cvd_score < 0.15) {
+      200
+    } else if(cvd_score < 0.2) {
+      100
+    } else {
+      0
+    }
+    
+    # g) Chroma variation - ensure colors aren't too desaturated
+    chroma_vals <- sqrt(lab_vals[,2]^2 + lab_vals[,3]^2)
+    chroma_penalty <- -sum(chroma_vals < 30) * 30
+    
+    # h) Hue spacing - encourage good hue distribution
+    lch_vals <- convert_colour(rgb_vals, from="rgb", to="lch")
+    hue_diffs <- diff(sort(lch_vals[,3]))
+    hue_spacing_score <- -sd(hue_diffs) * 0.3
+    
+    # Combine all components
+    final_score <- -(
+      min_dist_score +
+        dist_variance +
+        luminance_spread +
+        cluster_penalty +
+        extreme_luminance_penalty +
+        chroma_penalty +
+        hue_spacing_score
+    ) - cvd_penalty - initial_color_penalty
+    
+    if (!is.finite(final_score)) {
+      return(MAX_PENALTY)
+    }
+    
+    return(final_score)
+  }, error = function(e) {
+    return(MAX_PENALTY)
+  })
+}
+
 optimize_simple_palette <- function(initial_palette, weights, max_attempts = 10) {
   if (length(initial_palette) == 0) {
     stop("Initial palette cannot be empty")
@@ -622,7 +827,65 @@ optimize_scientific_palette <- function(initial_palette,
     result <- tryCatch({
       optim(
         par = current_initial,
-        fn = scientific_objective_function,
+        fn = harmonious_objective_function,
+        metric_weights = weights,
+        initial_colors = initial_colors,
+        method = "L-BFGS-B",
+        lower = rep(0, length(initial_numeric)),
+        upper = rep(1, length(initial_numeric)),
+        control = list(
+          maxit = 2500,
+          factr = 1e13,
+          pgtol = 1e-7
+        )
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(result) && is.finite(result$value) && result$value < best_score) {
+      best_result <- result
+      best_score <- result$value
+    }
+  }
+  
+  if (is.null(best_result)) {
+    stop("Optimization failed to find valid solution")
+  }
+  
+  optimized_palette <- unflatten_palette(best_result$par)
+  
+  return(list(
+    palette = sort_palette(optimized_palette),
+    score = best_result$value,
+    convergence = best_result$convergence
+  ))
+}
+
+optimize_categorical_palette <- function(initial_palette,
+                                        weights = scientific_weights,
+                                        max_attempts = 15) {
+  if (length(initial_palette) == 0) {
+    stop("Initial palette cannot be empty")
+  }
+  
+  initial_numeric <- flatten_palette(initial_palette)
+  initial_colors <- initial_palette[1:2]
+  
+  best_result <- NULL
+  best_score <- Inf
+  
+  for (attempt in 1:max_attempts) {
+    if (attempt > 1) {
+      noise <- rnorm(length(initial_numeric), 0, 0.03)
+      noise[1:(length(initial_colors) * 3)] <- 0
+      current_initial <- pmax(0, pmin(1, initial_numeric + noise))
+    } else {
+      current_initial <- initial_numeric
+    }
+    
+    result <- tryCatch({
+      optim(
+        par = current_initial,
+        fn = categorical_objective_function,
         metric_weights = weights,
         initial_colors = initial_colors,
         method = "L-BFGS-B",
@@ -728,7 +991,6 @@ initial_palettes <- lapply(
 
 compare_palettes(lapply(initial_palettes, sort_palette))
 
-
 cat("Starting optimization...\n")
 result <- future_lapply(initial_palettes,
                         FUN = optimize_simple_palette,
@@ -776,10 +1038,51 @@ test_scientific <- function(){
                           future.seed = TRUE)
   compare_palettes(lapply(result, function(x) x$palette))
   # Check perceptual uniformity
-  rgb_vals <- t(sapply(result$palette, function(color) col2rgb(color)/255))
+  rgb_vals <- t(sapply(result[[2]]$palette, function(color) col2rgb(color)/255))
   lab_vals <- convert_colour(rgb_vals, from="rgb", to="lab")
   plot(lab_vals[,1], type="l", main="Lightness Progression")
 
+  return(result)
+}
+
+test_categorical <- function(){
+  base_colors <- c("#F9A904", "#00559D")
+  weights <- c(
+    min_distance = 2.0,        # Highest priority - colors must be distinct
+    dist_variance = 0.5,       # Medium priority - ensure equal distinctiveness
+    luminance_spread = 1.0,    # High priority - similar visual weight
+    cluster_penalty = 0.5,     # Medium priority - avoid similar colors
+    extreme_luminance = 50,    # High penalty for too dark/light colors
+    chroma_penalty = 30,       # Significant penalty for desaturated colors
+    hue_spacing = 0.3         # Lower priority - allow some hue clustering if needed
+  )
+  
+  base_variants <- generate_base_variants(base_colors,
+                                          max_delta_e = 0.03,
+                                          n_variations = 15)
+  compare_palettes(base_variants)
+  
+  initial_palettes <- lapply(
+    base_variants,
+    function(i) {
+      generate_simple_palettes(i, n_colors = 8)
+    }
+  )
+  
+  compare_palettes(lapply(initial_palettes, sort_palette))
+  
+  
+  cat("Starting optimization...\n")
+  result <- future_lapply(initial_palettes,
+                          FUN = optimize_categorical_palette,
+                          weights = weights,
+                          future.seed = TRUE)
+  compare_palettes(lapply(result, function(x) x$palette))
+  # Check perceptual uniformity
+  rgb_vals <- t(sapply(result[[2]]$palette, function(color) col2rgb(color)/255))
+  lab_vals <- convert_colour(rgb_vals, from="rgb", to="lab")
+  plot(lab_vals[,1], type="l", main="Lightness Progression")
+  
   return(result)
 }
 
@@ -788,3 +1091,212 @@ simple_results = test_simple()
 
 sciency_result = test_scientific()
 
+
+
+#####################################################################################
+
+
+
+# Force-directed layout in LAB space
+simulate_color_repulsion <- function(n_colors, max_iterations = 100, learning_rate = 0.1) {
+  # Initialize points randomly in LAB space
+  # L: 30-90 to avoid extremes
+  # a,b: -80 to 80 to stay within typical gamut
+  points <- matrix(nrow = n_colors, ncol = 3)
+  points[,1] <- runif(n_colors, 30, 90)  # L
+  points[,2] <- runif(n_colors, -80, 80)  # a
+  points[,3] <- runif(n_colors, -80, 80)  # b
+  
+  for(iter in 1:max_iterations) {
+    # Calculate repulsive forces between all pairs
+    forces <- matrix(0, nrow = n_colors, ncol = 3)
+    
+    for(i in 1:n_colors) {
+      for(j in 1:n_colors) {
+        if(i != j) {
+          # Vector from j to i
+          diff <- points[i,] - points[j,]
+          # Distance between points
+          dist <- sqrt(sum(diff^2))
+          # Force magnitude (inverse square law)
+          magnitude <- 1 / (dist^2)
+          # Accumulate force
+          forces[i,] <- forces[i,] + diff/dist * magnitude
+        }
+      }
+    }
+    
+    # Apply forces with decreasing learning rate
+    current_lr <- learning_rate * (1 - iter/max_iterations)
+    points <- points + forces * current_lr
+    
+    # Constrain points to stay in reasonable LAB space
+    points[,1] <- pmax(30, pmin(90, points[,1]))  # L
+    points[,2] <- pmax(-80, pmin(80, points[,2]))  # a
+    points[,3] <- pmax(-80, pmin(80, points[,3]))  # b
+  }
+  
+  return(points)
+}
+
+generate_base_distribution <- function(n_colors) {
+  # Use force-directed layout to get well-distributed points
+  lab_points <- simulate_color_repulsion(n_colors)
+  
+  # Convert to RGB
+  rgb_colors <- convert_colour(lab_points, from="lab", to="rgb")/255
+  
+  # Clip to valid RGB space
+  rgb_colors <- matrix(pmax(0, pmin(1, rgb_colors)), ncol = 3, byrow = TRUE)
+  
+  # Convert to hex
+  hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
+  
+  return(list(
+    hex = hex_colors,
+    lab = lab_points,
+    rgb = rgb_colors
+  ))
+}
+
+adjust_for_cvd <- function(colors, iterations = 50) {
+  lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
+  
+  best_score <- validate_cvd(colors$hex)
+  best_points <- lab_points
+  
+  for(i in 1:iterations) {
+    # Small random perturbation
+    noise <- matrix(rnorm(prod(dim(lab_points)), 0, 0.2 * mean(abs(lab_points))), ncol = 3)
+    new_points <- lab_points + noise
+    
+    # Constrain to valid LAB space
+    new_points[,1] <- pmax(30, pmin(90, new_points[,1]))
+    new_points[,2] <- pmax(-80, pmin(80, new_points[,2]))
+    new_points[,3] <- pmax(-80, pmin(80, new_points[,3]))
+    
+    # Convert to RGB for evaluation
+    rgb_test <- convert_colour(new_points, from="lab", to="rgb")/255
+    # Check if in gamut
+    if(any(rgb_test < 0 | rgb_test > 1)) next
+    
+    hex_test <- rgb(rgb_test[,1], rgb_test[,2], rgb_test[,3])
+    score <- validate_cvd(hex_test)
+    
+    if(score > best_score) {
+      best_score <- score
+      best_points <- new_points
+    }
+  }
+  
+  # Convert best result back to RGB and hex
+  best_rgb <- convert_colour(best_points, from="lab", to="rgb")/255
+  best_hex <- rgb(best_rgb[,1], best_rgb[,2], best_rgb[,3])
+  
+  return(list(
+    hex = best_hex,
+    lab = best_points,
+    rgb = best_rgb
+  ))
+}
+
+fine_tune_aesthetics <- function(colors) {
+  lab_points <- convert_colour(255 * colors$rgb, from="rgb", to="lab")
+  
+  # Adjust chroma to ensure colors are sufficiently saturated
+  lch_points <- convert_colour(255 * colors$rgb, from="rgb", to="lch")
+  low_chroma <- lch_points[,2] < 30
+  if(any(low_chroma)) {
+    lch_points[low_chroma,2] <- 30
+    # Convert back through LAB to RGB
+    lab_points <- convert_colour(lch_points, from="lch", to="lab")
+  }
+  
+  # Ensure colors aren't too dark or light
+  lab_points[,1] <- pmax(30, pmin(90, lab_points[,1]))
+  
+  # Convert to RGB
+  rgb_colors <- convert_colour(lab_points, from="lab", to="rgb")/255
+  # Clip to valid RGB
+  rgb_colors <-  matrix(pmax(0, pmin(1, rgb_colors)), ncol = 3, byrow = TRUE)
+  # Convert to hex
+  hex_colors <- rgb(rgb_colors[,1], rgb_colors[,2], rgb_colors[,3])
+  
+  return(list(
+    hex = hex_colors,
+    lab = lab_points,
+    rgb = rgb_colors
+  ))
+}
+
+generate_categorical_palette <- function(n_colors, base_colors = NULL) {
+  # Stage 1: Generate well-distributed colors
+  cat("Stage 1: Generating base distribution...\n")
+  colors <- generate_base_distribution(n_colors)
+  
+  # Stage 2: Adjust for CVD
+  cat("Stage 2: Adjusting for color vision deficiency...\n")
+  colors <- adjust_for_cvd(colors)
+  
+  # Stage 3: Fine-tune aesthetics
+  cat("Stage 3: Fine-tuning aesthetics...\n")
+  colors <- fine_tune_aesthetics(colors)
+  
+  # If base colors provided, try to incorporate them
+  if(!is.null(base_colors)) {
+    # Find closest colors in generated palette and swap
+    for(base_color in base_colors) {
+      rgb_base <- col2rgb(base_color)/255
+      lab_base <- convert_colour(matrix(rgb_base, ncol=3), from="rgb", to="lab")
+      
+      # Find closest color in palette
+      distances <- apply(colors$lab, 1, function(x) sum((x - lab_base)^2))
+      closest <- which.min(distances)
+      
+      # Replace with base color
+      colors$hex[closest] <- base_color
+      colors$rgb[closest,] <- rgb_base
+      colors$lab[closest,] <- lab_base
+    }
+  }
+  
+  return(colors)
+}
+
+plot_palette_info <- function(colors) {
+  par(mfrow=c(2,2))
+  
+  # Plot colors
+  plot(NA, xlim=c(0,1), ylim=c(0,1), xlab="", ylab="", main="Palette")
+  for(i in seq_along(colors$hex)) {
+    rect((i-1)/length(colors$hex), 0, i/length(colors$hex), 1, 
+         col=colors$hex[i], border=NA)
+  }
+  
+  # Plot LAB space distribution
+  plot(colors$lab[,2], colors$lab[,3], 
+       col=colors$hex, pch=16, cex=2,
+       xlab="a", ylab="b", main="LAB Space Distribution")
+  
+  # Plot lightness distribution
+  hist(colors$lab[,1], main="Lightness Distribution",
+       xlab="L", breaks=10)
+  
+  # Plot CVD simulation
+  deutan_sim <- deutan(colors$hex)
+  plot(NA, xlim=c(0,1), ylim=c(0,1), xlab="", ylab="", 
+       main="Deuteranopia Simulation")
+  for(i in seq_along(deutan_sim)) {
+    rect((i-1)/length(deutan_sim), 0, i/length(deutan_sim), 1, 
+         col=deutan_sim[i], border=NA)
+  }
+}
+
+result <- generate_categorical_palette(8, base_colors = c("#F9A904", "#00559D"))
+plot_palette_info(result)
+
+# Compare with original base colors
+compare_palettes(list(
+  result$hex,
+  generate_simple_palettes(c("#F9A904", "#00559D"), n_colors = 8)
+))
